@@ -1,0 +1,69 @@
+run_id: comparative-1-qwen3-8b-svamp
+method: PIR-AutoCoT (Paraphrase-Invariant Reliability Auto-CoT)
+model:
+  name: Qwen3-8B
+  hf_name: Qwen/Qwen3-8B
+  dtype: bf16
+  device: cuda
+  max_new_tokens: 256
+  generation:
+    greedy_eval: true
+    sample_temperature_sc: 0.7
+    sample_top_p: 0.95
+    paraphrase_temperature: 0.8
+dataset:
+  name: MU-NLPC/Calc-svamp
+  task: arithmetic_word_problems
+  splits:
+    train: train[:500]
+    test: test[:200]
+  fields:
+    question: question
+    answer: answer
+  preprocessing:
+    max_length: 512
+    lowercase: false
+training:
+  task: inference_only
+  learning_rate: 0.0
+  batch_size: 1
+  eval_batch_size: 1
+  epochs: 1
+  optimizer: adamw
+  weight_decay: 0.0
+  gradient_accumulation_steps: 1
+  seed: 0
+method_config:
+  k_clusters: 8
+  max_candidates_per_cluster: 10
+  m_self_consistency: 4
+  p_paraphrases: 2
+  tau_reliability: 0.4
+  number_preservation_filter: true
+  embedder_name: sentence-transformers/all-MiniLM-L6-v2
+  fallback_demo: single_chain_if_rejected
+  diagnostics:
+    track_acceptance_rate: true
+    track_reliability_components: true
+optuna:
+  n_trials: 20
+  search_spaces:
+    - param_name: tau
+      distribution_type: uniform
+      low: 0.2
+      high: 0.8
+    - param_name: m
+      distribution_type: categorical
+      choices: [3, 4, 6]
+    - param_name: p
+      distribution_type: categorical
+      choices: [1, 2, 3]
+    - param_name: temperature_sc
+      distribution_type: uniform
+      low: 0.4
+      high: 0.9
+metrics:
+  primary: accuracy
+  additional:
+    - demo_acceptance_rate
+    - mean_reliability_components

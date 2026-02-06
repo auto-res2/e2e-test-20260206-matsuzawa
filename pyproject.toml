@@ -1,1 +1,25 @@
-# Please list the required python packages.
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "c3-autocot"
+version = "0.1.0"
+description = "Cycle-Consistent & Paraphrase-Invariant Reliability Auto-CoT experiments"
+requires-python = ">=3.9"
+dependencies = [
+  "torch>=2.1.0",
+  "transformers>=4.36.0",
+  "datasets>=2.14.0",
+  "sentence-transformers>=2.2.2",
+  "scikit-learn>=1.3.0",
+  "numpy>=1.24.0",
+  "pandas>=2.0.0",
+  "matplotlib>=3.7.0",
+  "seaborn>=0.12.0",
+  "optuna>=3.4.0",
+  "hydra-core>=1.3.2",
+  "wandb>=0.16.0",
+  "scipy>=1.10.0",
+  "accelerate>=0.25.0",
+]

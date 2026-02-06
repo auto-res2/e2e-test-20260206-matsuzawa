@@ -1,0 +1,20 @@
+defaults:
+  - run: proposed-qwen3-8b-svamp
+  - _self_
+
+mode: full
+results_dir: ./results
+
+wandb:
+  entity: airas
+  project: 2026-02-06
+  mode: online
+
+optuna: ${run.optuna}
+
+hydra:
+  run:
+    dir: ${results_dir}/${run.run_id}
+  output_subdir: null
+  job:
+    chdir: false
