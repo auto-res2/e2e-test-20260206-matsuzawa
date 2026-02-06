@@ -32,4 +32,7 @@ runs:
         anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
         prompt: ${{ inputs.prompt }}
         allowed_bots: '*' 
-        claude_args: "--model=${{ inputs.model_name }} --max-turns=${{ inputs.max_turns }} --allowed-tools ${{ inputs.allowed_tools }}"
+        claude_args: |
+          --model ${{ inputs.model_name }}
+          --max-turns ${{ inputs.max_turns }}
+          --allowed-tools ${{ inputs.allowed_tools }}
