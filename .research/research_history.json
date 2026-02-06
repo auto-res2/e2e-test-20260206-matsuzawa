@@ -959,5 +959,127 @@
     "experimental_code": "import re, random\nimport numpy as np\nfrom collections import Counter\n\nimport torch\nfrom datasets import load_dataset\nfrom transformers import AutoTokenizer, AutoModelForSeq2SeqLM\nfrom sentence_transformers import SentenceTransformer\nfrom sklearn.cluster import KMeans\n\nnum_re = re.compile(r\"-?\\d+(?:\\.\\d+)?\")\n\ndef extract_numbers(s: str):\n    return num_re.findall(s)\n\ndef extract_final_number(text: str):\n    nums = extract_numbers(text)\n    return nums[-1] if nums else None\n\ndef agreement_rate(answers):\n    answers = [a for a in answers if a is not None]\n    if not answers:\n        return 0.0, None\n    c = Counter(answers)\n    maj, ct = c.most_common(1)[0]\n    return ct / len(answers), maj\n\n@torch.inference_mode()\ndef generate_texts(model, tok, prompt, n=1, do_sample=True, temperature=0.7, max_new_tokens=256):\n    inp = tok(prompt, return_tensors='pt', truncation=True).to(model.device)\n    outs = model.generate(\n        **inp,\n        do_sample=do_sample,\n        temperature=temperature if do_sample else None,\n        top_p=0.95 if do_sample else None,\n        num_return_sequences=n,\n        max_new_tokens=max_new_tokens,\n    )\n    return tok.batch_decode(outs, skip_special_tokens=True)\n\ndef sample_cot(model, tok, question, n_samples=4, temperature=0.7):\n    prompt = f\"Q: {question}\\nA: Let's think step by step.\"\n    return generate_texts(model, tok, prompt, n=n_samples, do_sample=True, temperature=temperature)\n\ndef paraphrase_question(model, tok, question, n_para=2):\n    prompt = (\n        \"Paraphrase the following word problem without changing its meaning or numbers. \"\n        \"Return only the paraphrased question.\\n\\n\"\n        f\"Problem: {question}\\nParaphrase:\"\n    )\n    paras = generate_texts(model, tok, prompt, n=n_para, do_sample=True, temperature=0.8, max_new_tokens=128)\n    paras = [p.strip() for p in paras if p.strip()]\n    # de-dup\n    out = []\n    for p in paras:\n        if p.lower() != question.strip().lower() and p not in out:\n            out.append(p)\n    return out[:n_para]\n\ndef numbers_preserved(q, q2):\n    return extract_numbers(q) == extract_numbers(q2)\n\ndef reconstruct_question(model, tok, chain_text):\n    # Cycle-consistency: can the model reconstruct the question it claims to have solved?\n    prompt = (\n        \"You are given a step-by-step solution to a math word problem. \"\n        \"Reconstruct the original word problem as precisely as possible, preserving all numbers. \"\n        \"Return only the problem statement.\\n\\n\"\n        f\"Solution:\\n{chain_text}\\n\\nProblem:\"\n    )\n    return generate_texts(model, tok, prompt, n=1, do_sample=False, max_new_tokens=128)[0].strip()\n\ndef cosine_sim(a, b, eps=1e-8):\n    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + eps))\n\ndef build_demo_c3(model, tok, embedder, question, m=4, p=2, tau=0.33, temperature=0.7):\n    # 1) paraphrases with numeric-preservation filter\n    paras = [q2 for q2 in paraphrase_question(model, tok, question, n_para=p) if numbers_preserved(question, q2)]\n    variants = [question] + paras\n\n    # Need at least one valid paraphrase to make r_pi meaningful\n    if len(variants) == 1:\n        return None\n\n    variant_answers, variant_chains = [], []\n    all_answers = []\n\n    for qv in variants:\n        chains = sample_cot(model, tok, qv, n_samples=m, temperature=temperature)\n        ans = [extract_final_number(c) for c in chains]\n        variant_chains.append(chains)\n        variant_answers.append(ans)\n        all_answers.extend([a for a in ans if a is not None])\n\n    _, global_maj = agreement_rate(all_answers)\n    if global_maj is None:\n        return None\n\n    # 2) r_sc on original\n    r_sc, _ = agreement_rate(variant_answers[0])\n\n    # 3) r_pi on paraphrases: fraction matching global majority\n    pi_scores = []\n    for ans in variant_answers[1:]:\n        valid = [a for a in ans if a is not None]\n        if not valid:\n            pi_scores.append(0.0)\n        else:\n            pi_scores.append(sum(a == global_maj for a in valid) / len(valid))\n    r_pi = float(np.mean(pi_scores)) if pi_scores else 0.0\n\n    # pick representative chain from original that matches global majority\n    rep = None\n    for c in variant_chains[0]:\n        if extract_final_number(c) == global_maj:\n            rep = c\n            break\n    if rep is None:\n        return None\n\n    # 4) r_cc: cycle-consistency / grounding\n    q_hat = reconstruct_question(model, tok, rep)\n    emb_q = embedder.encode([question], normalize_embeddings=True)[0]\n    emb_hat = embedder.encode([q_hat], normalize_embeddings=True)[0]\n    sim = cosine_sim(emb_q, emb_hat)\n    num_ok = 1.0 if numbers_preserved(question, q_hat) else 0.0\n    r_cc = 0.5 * sim + 0.5 * num_ok\n\n    r = float(r_sc * r_pi * r_cc)\n    if r < tau:\n        return None\n\n    demo = f\"Q: {question}\\nA: {rep}\\n\"\n    diag = {\"r_sc\": float(r_sc), \"r_pi\": float(r_pi), \"r_cc\": float(r_cc), \"r\": r, \"global_maj\": global_maj, \"n_para_ok\": len(paras)}\n    return demo, diag\n\n@torch.inference_mode()\ndef predict_with_demos(model, tok, demos, question, max_new_tokens=256):\n    prompt = \"\".join(demos) + f\"Q: {question}\\nA: Let's think step by step.\"\n    inp = tok(prompt, return_tensors='pt', truncation=True).to(model.device)\n    out = model.generate(**inp, do_sample=False, max_new_tokens=max_new_tokens)\n    text = tok.decode(out[0], skip_special_tokens=True)\n    return extract_final_number(text)\n\ndef eval_acc(model, tok, demos, test_split, n_eval=200):\n    subset = test_split.select(range(min(n_eval, len(test_split))))\n    correct = 0\n    for ex in subset:\n        pred = predict_with_demos(model, tok, demos, ex[\"question\"])\n        gold = extract_final_number(ex[\"answer\"])\n        correct += int(pred == gold)\n    return correct / len(subset)\n\nif __name__ == \"__main__\":\n    torch.manual_seed(0); random.seed(0); np.random.seed(0)\n\n    ds = load_dataset(\"svamp\")\n    train = ds[\"train\"].select(range(500))\n    test = ds[\"test\"]\n    train_q = [x[\"question\"] for x in train]\n\n    device = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n    model_name = \"google/flan-t5-base\"\n    tok = AutoTokenizer.from_pretrained(model_name)\n    model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)\n\n    # Auto-CoT clustering\n    embedder = SentenceTransformer(\"sentence-transformers/all-MiniLM-L6-v2\")\n    X = embedder.encode(train_q, normalize_embeddings=True, show_progress_bar=False)\n    k = 8\n    km = KMeans(n_clusters=k, random_state=0, n_init=\"auto\").fit(X)\n\n    demos_c3, stats = [], []\n    for c in range(k):\n        idxs = np.where(km.labels_ == c)[0]\n        dists = np.linalg.norm(X[idxs] - km.cluster_centers_[c], axis=1)\n        order = idxs[np.argsort(dists)]\n\n        demo = None\n        for j in order[:10]:\n            out = build_demo_c3(model, tok, embedder, train_q[j], m=4, p=2, tau=0.33)\n            if out is not None:\n                demo, st = out\n                stats.append(st)\n                break\n        if demo is None:\n            # fallback: simple one-shot rationale\n            chain = sample_cot(model, tok, train_q[order[0]], n_samples=1, temperature=0.7)[0]\n            demo = f\"Q: {train_q[order[0]]}\\nA: {chain}\\n\"\n            stats.append({\"r_sc\": 0.0, \"r_pi\": 0.0, \"r_cc\": 0.0, \"r\": 0.0, \"global_maj\": None, \"n_para_ok\": 0})\n        demos_c3.append(demo)\n\n    acc = eval_acc(model, tok, demos_c3, test, n_eval=200)\n    print({\n        \"acc_c3_autocot\": acc,\n        \"mean_r\": float(np.mean([s[\"r\"] for s in stats])),\n        \"reject_frac\": float(np.mean([s[\"r\"] == 0.0 for s in stats])),\n        \"mean_r_cc\": float(np.mean([s[\"r_cc\"] for s in stats])),\n        \"mean_n_para_ok\": float(np.mean([s[\"n_para_ok\"] for s in stats]))\n    })\n",
     "expected_result": "On SVAMP (200-example test subset) with `flan-t5-base`, k=8 demos, m=4, p=2:\n- Auto-CoT: 0.20–0.28 accuracy\n- RW-AutoCoT: 0.23–0.32\n- PIR-AutoCoT: 0.27–0.36\n- **C3-AutoCoT (proposed): 0.30–0.40**\n\nExpected absolute gains:\n- C3 vs Auto-CoT: +0.07 to +0.12\n- C3 vs PIR-AutoCoT: +0.02 to +0.05\n\nMechanism checks:\n- Paraphrase numeric-preservation filter will discard ~10–30% paraphrases (reducing semantic drift noise).\n- r_cc will be lower for rejected demos and will positively correlate with downstream accuracy across clusters.\n\nHigher is better for accuracy.",
     "expected_conclusion": "C3-AutoCoT strengthens Auto-CoT with a cognitively inspired **triple-check** that better matches human verification: (1) re-derive (self-consistency), (2) rephrase (paraphrase invariance), and (3) **reconstruct (cycle-consistency grounding)**. This targets a sharper and more socially relevant failure mode than PIR alone: demonstrations that are stable yet *solve a different problem than asked*.\n\nAcademically, the contribution is a more novel notion of label-free demo trust: not just robustness of the *answer* under restatement, but robustness of the **question–rationale mapping** under a cycle constraint, plus a cheap metamorphic safeguard (number preservation) that makes invariance tests reliable.\n\nPractically, by filtering ungrounded explanations offline without training or external verifiers, C3-AutoCoT reduces the chance that real-world systems (education, customer support, decision aids) present persuasive step-by-step reasoning that is detached from the user’s actual query—improving reliability while preserving the simplicity and reproducibility of Auto-CoT-style prompting."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: Solve elementary arithmetic word problems by generating a chain-of-thought (CoT) rationale and a final numeric answer.\n\nPurpose: Demonstrate that C3-AutoCoT (Cycle-Consistent & Paraphrase-Invariant Reliability Auto-CoT) yields higher downstream problem-solving accuracy than a strong label-free baseline (PIR-AutoCoT) by filtering out “plausible but ungrounded” candidate demonstrations during the *demo construction* stage.\n\nCore idea / workflow:\n1) **Demo pool**: Take the first 500 SVAMP training questions as the candidate pool for building in-context demonstrations.\n2) **Clustering (Auto-CoT stage, shared across methods)**:\n   - Embed all 500 candidate questions with a sentence-embedding model (e.g., `sentence-transformers/all-MiniLM-L6-v2`).\n   - Run k-means with k=8 to form 8 clusters; each cluster will contribute 1 demonstration.\n   - For each cluster, rank candidate questions by distance to the cluster centroid.\n3) **Demo selection (varies by method)**:\n   - **PIR-AutoCoT**: for each candidate question near the centroid, estimate reliability from (i) within-question self-consistency and (ii) paraphrase invariance, then accept if reliability ≥ τ.\n   - **C3-AutoCoT (proposed)**: additionally enforce a **cycle-consistency grounding check**: can the LLM reconstruct the original question from its own rationale, and does the reconstruction match the original question semantically (embedding cosine similarity) and numerically (exact number multiset match)? Accept the demo only if r = r_sc·r_pi·r_cc ≥ τ and at least one paraphrase passes a number-preservation metamorphic filter.\n4) **Evaluation**:\n   - Build exactly 8 demos (1 per cluster) offline once.\n   - Evaluate on the first 200 SVAMP test questions using greedy decoding with the fixed 8-demo prompt.\n   - Report accuracy and diagnostic metrics (acceptance rates and reliability components).\n\nScale fit to the provided Runner (NVIDIA H200 140GB VRAM, 240GB RAM):\n- Use **one 8B model** (fits comfortably in bf16/fp16) and keep generation batch size at 1–2.\n- Limit offline demo-building to: k=8 clusters × up to T=10 candidates/cluster × (m=4 SC samples) × (1 original + up to p=2 paraphrases) + 1 reconstruction → at most ~8×10×(12 generations + 1) ≈ ~1,040 short generations.\n- Limit evaluation to **N=200** test questions with greedy decoding (200 generations).\n- Total generations are ~1.2k, feasible on a single H200 in one run (minutes to low-hours depending on max tokens).\n- No training, no verifier model; only lightweight embedding computation and regex-based number extraction.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA H200, VRAM: 140 GB, RAM: 240 GB"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "**What it measures:** End-task correctness: proportion of SVAMP test questions for which the model outputs the correct final numeric answer.\n\n**Correctness criteria:**\n1) Extract the model’s *predicted final answer* as a number using a robust rule:\n   - Prefer the last number token in the generated text after stripping commas and whitespace; if the output contains an explicit final-answer marker (e.g., 'Answer:'), prefer the last number after that marker.\n2) Extract the gold answer as a number from the dataset field (`answer`/`result`).\n3) Compare:\n   - If both parse as integers (or integer-valued floats), require exact equality.\n   - Otherwise require absolute tolerance ≤ 1e-3 (handles benign formatting like 0.5 vs 0.500).\n   - If the prediction is missing/unparseable, count as incorrect.\n\n**Calculation method:**\nFor n evaluated examples,\n- accuracy = (1/n) * Σ_i 𝟙[pred_i == gold_i under the numeric comparison above].\n\n**Task appropriateness:** SVAMP is a numeric-answer word-problem benchmark; correctness is primarily about the final number rather than rationale style.\n\n**Relevant visualizations:**\n- Bar chart of accuracy with 95% bootstrap CIs per method.\n- Error histogram of (pred − gold) for numeric non-integer outputs (if any)."
+      },
+      {
+        "name": "demo_acceptance_rate",
+        "description": "**What it measures:** How often a candidate question is accepted as a demonstration under the method’s reliability filter (proxy for strictness and practicality).\n\n**Correctness criteria:** A demo is “accepted” if it passes the method’s acceptance rule for a cluster within the top-T candidates.\n\n**Calculation method:**\nFor k clusters, let c_j be the number of candidates tried until acceptance (capped at T). Define:\n- acceptance_rate = (1/k) * Σ_j 𝟙[accepted within T].\nAlso report mean candidates tried: (1/k) * Σ_j c_j.\n\n**Task appropriateness:** A method that improves accuracy but rarely accepts demos may be impractical; this metric captures that trade-off.\n\n**Relevant visualizations:**\n- Per-cluster acceptance/attempts bar plot.\n- Histogram of candidates tried until acceptance."
+      },
+      {
+        "name": "mean_reliability_components",
+        "description": "**What it measures:** Average values of the reliability sub-scores used in selection: r_sc (self-consistency), r_pi (paraphrase invariance), and (for C3) r_cc (cycle-consistency grounding).\n\n**Correctness criteria:**\n- r_sc: computed from m sampled CoTs on the original question as the majority-answer frequency.\n- r_pi: computed as the mean probability of producing the global majority answer across paraphrases (estimated by sample frequencies).\n- r_cc: computed as 0.5·cos_sim(emb(q̂), emb(q)) + 0.5·𝟙[numbers(q̂)=numbers(q)].\n\n**Calculation method:**\nFor accepted demos D (|D|=k typically), report:\n- mean_r_sc = (1/|D|) Σ_d r_sc(d)\n- mean_r_pi = (1/|D|) Σ_d r_pi(d)\n- mean_r_cc = (1/|D|) Σ_d r_cc(d) (C3 only)\n- mean_r = (1/|D|) Σ_d (r_sc·r_pi·r_cc) (C3) or (r_sc·r_pi) (PIR).\n\n**Task appropriateness:** Validates the hypothesized mechanism (C3 rejects mis-anchored demos via r_cc).\n\n**Relevant visualizations:**\n- Box/violin plots of r_sc/r_pi/r_cc by method.\n- Scatter plot of r_cc vs per-demo downstream utility (see next metric)."
+      },
+      {
+        "name": "grounding_utility_correlation",
+        "description": "**What it measures:** Whether the grounding proxy r_cc predicts downstream usefulness of a selected demonstration (mechanistic validation).\n\n**Correctness criteria:**\n- For each cluster demo d, compute its downstream utility u(d) as the accuracy on the subset of test questions whose embedding is closest to that cluster centroid (or alternatively the subset assigned to that cluster by k-means trained on the demo pool embeddings).\n- Correlate u(d) with r_cc(d) across clusters.\n\n**Calculation method:**\n- Assign each of the N test questions to the nearest of the k cluster centroids (computed from the demo-pool k-means model).\n- For cluster j with demo d_j, compute u_j = (# correct predictions among assigned test questions)/(# assigned test questions).\n- Compute Pearson r (and optionally Spearman ρ) between {r_cc(d_j)} and {u_j}.\n\n**Task appropriateness:** The hypothesis claims r_cc detects mis-anchored reasoning; if true, higher r_cc should align with higher real utility.\n\n**Relevant visualizations:**\n- Scatter plot with regression line: r_cc vs u_j (one point per cluster), with correlation coefficient annotated."
+      }
+    ],
+    "models_to_use": [
+      "Qwen3-8B (8B parameters)"
+    ],
+    "datasets_to_use": [
+      "SVAMP (MU-NLPC/Calc-svamp)"
+    ],
+    "proposed_method": {
+      "method_name": "C3-AutoCoT (Cycle-Consistent & Paraphrase-Invariant Reliability Auto-CoT)",
+      "description": "Inference-only enhancement to Auto-CoT demonstration construction. For each candidate demo question, estimate reliability along three label-free axes using only the same base LLM plus cheap post-processing: (1) within-question self-consistency (r_sc), (2) paraphrase invariance with a number-preservation metamorphic filter (r_pi), and (3) cycle-consistency grounding (r_cc) by reconstructing the original question from a representative rationale and scoring semantic+numeric match. Accept a demo if r=r_sc·r_pi·r_cc≥τ, then use standard Auto-CoT downstream prompting with k cluster demos.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "tau",
+            "distribution_type": "uniform",
+            "low": 0.2,
+            "high": 0.6
+          },
+          {
+            "param_name": "m",
+            "distribution_type": "categorical",
+            "choices": [
+              3,
+              4,
+              6
+            ]
+          },
+          {
+            "param_name": "p",
+            "distribution_type": "categorical",
+            "choices": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "param_name": "temperature_sc",
+            "distribution_type": "uniform",
+            "low": 0.4,
+            "high": 0.9
+          },
+          {
+            "param_name": "rcc_weight_sim",
+            "distribution_type": "uniform",
+            "low": 0.3,
+            "high": 0.7
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "PIR-AutoCoT (Paraphrase-Invariant Reliability Auto-CoT)",
+        "description": "Inference-only demo filtering baseline that extends RW-AutoCoT: accept candidate demos based on (1) within-question self-consistency under multiple sampled CoTs and (2) paraphrase invariance of the answer across LLM-generated paraphrases. Does not include cycle-consistency reconstruction/grounding; reliability combines only r_sc and r_pi (e.g., r=r_sc·r_pi). Uses the same clustering and the same downstream evaluation prompting as C3-AutoCoT.",
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "tau",
+              "distribution_type": "uniform",
+              "low": 0.2,
+              "high": 0.8
+            },
+            {
+              "param_name": "m",
+              "distribution_type": "categorical",
+              "choices": [
+                3,
+                4,
+                6
+              ]
+            },
+            {
+              "param_name": "p",
+              "distribution_type": "categorical",
+              "choices": [
+                1,
+                2,
+                3
+              ]
+            },
+            {
+              "param_name": "temperature_sc",
+              "distribution_type": "uniform",
+              "low": 0.4,
+              "high": 0.9
+            }
+          ]
+        }
+      }
+    ]
   }
 }
