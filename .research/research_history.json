@@ -805,7 +805,7 @@
     "expected_conclusion": "CAM-CoT refines “human-like CoT” from a single uncertainty-triggered switch into an **anytime, multi-stage metacognitive controller** with **separate, checkable reliability guarantees** for each early-exit stage. This is academically valuable because it operationalizes System-1→System-2 escalation as a *sequence of selective predictors* and connects CoT prompting to finite-sample risk control in a way that better matches real deployments (multiple stopping points, explicit safety knobs).\n\nPractically and socially, CAM-CoT offers a transparent policy interface—(α1, α2, δ, p_min_ood)—to bound the failure rate of cheap answers while saving compute/energy by avoiding unnecessary long rationales. The additional conformal OOD guard makes the approach meaningfully safer under distribution shift by defaulting to deliberation when uncertainty scores are atypical, reducing the risk of confidently wrong “fast” outputs in new domains."
   },
   "experimental_design": {
-    "experiment_summary": "Task: Solve elementary arithmetic word problems by generating a chain-of-thought (CoT) rationale and a final numeric answer.\n\nPurpose: Demonstrate that C3-AutoCoT (Cycle-Consistent & Paraphrase-Invariant Reliability Auto-CoT) yields higher downstream problem-solving accuracy than a strong label-free baseline (PIR-AutoCoT) by filtering out “plausible but ungrounded” candidate demonstrations during the *demo construction* stage.\n\nCore idea / workflow:\n1) **Demo pool**: Take the first 500 SVAMP training questions as the candidate pool for building in-context demonstrations.\n2) **Clustering (Auto-CoT stage, shared across methods)**:\n   - Embed all 500 candidate questions with a sentence-embedding model (e.g., `sentence-transformers/all-MiniLM-L6-v2`).\n   - Run k-means with k=8 to form 8 clusters; each cluster will contribute 1 demonstration.\n   - For each cluster, rank candidate questions by distance to the cluster centroid.\n3) **Demo selection (varies by method)**:\n   - **PIR-AutoCoT**: for each candidate question near the centroid, estimate reliability from (i) within-question self-consistency and (ii) paraphrase invariance, then accept if reliability ≥ τ.\n   - **C3-AutoCoT (proposed)**: additionally enforce a **cycle-consistency grounding check**: can the LLM reconstruct the original question from its own rationale, and does the reconstruction match the original question semantically (embedding cosine similarity) and numerically (exact number multiset match)? Accept the demo only if r = r_sc·r_pi·r_cc ≥ τ and at least one paraphrase passes a number-preservation metamorphic filter.\n4) **Evaluation**:\n   - Build exactly 8 demos (1 per cluster) offline once.\n   - Evaluate on the first 200 SVAMP test questions using greedy decoding with the fixed 8-demo prompt.\n   - Report accuracy and diagnostic metrics (acceptance rates and reliability components).\n\nScale fit to the provided Runner (NVIDIA H200 140GB VRAM, 240GB RAM):\n- Use **one 8B model** (fits comfortably in bf16/fp16) and keep generation batch size at 1–2.\n- Limit offline demo-building to: k=8 clusters × up to T=10 candidates/cluster × (m=4 SC samples) × (1 original + up to p=2 paraphrases) + 1 reconstruction → at most ~8×10×(12 generations + 1) ≈ ~1,040 short generations.\n- Limit evaluation to **N=200** test questions with greedy decoding (200 generations).\n- Total generations are ~1.2k, feasible on a single H200 in one run (minutes to low-hours depending on max tokens).\n- No training, no verifier model; only lightweight embedding computation and regex-based number extraction.",
+    "experiment_summary": "Task: Given a grade-school math word problem, the model must output a single final numeric answer. The experiment evaluates an inference-time controller that decides how much reasoning to generate per query—(i) Direct answer (no rationale), (ii) Brief-CoT (bounded short rationale), or (iii) Full-CoT (longer rationale)—and measures whether this controller can maintain statistically controlled error rates for early exits while improving accuracy–compute tradeoffs.\n\nPurpose: Demonstrate that CAM-CoT (Conformal Anytime Metacognitive CoT) is superior to a strong existing “conformal risk-controlled” single-gate baseline by:\n1) Providing *stagewise* finite-sample error guarantees separately for Direct exits and Brief-CoT exits (two selective predictors, two risk constraints).\n2) Jointly selecting two thresholds (τ1, τ2) to minimize expected compute (generated tokens) subject to those two risk constraints.\n3) Adding a training-free conformal OOD/shift guard that disables early exits when the Direct-stage uncertainty score is atypical relative to calibration.\n\nWorkflow (single-model, single-dataset):\n1) Load GSM8K test split; take the first 300 examples.\n2) Split into Calibration (first 60) and Evaluation (next 240).\n3) For each calibration example, run the model once in each mode: Direct (max 16 new tokens), Brief-CoT (max 64), Full-CoT (max 128). Record:\n   - predicted final number per mode,\n   - correctness per mode,\n   - uncertainty score s1 (Direct) and s2 (Brief) computed from token-level logprobs,\n   - generated token counts.\n4) Calibrate CAM-CoT:\n   - Use the calibration s1 distribution to define a conformal typicality p-value for each query; if p < p_min, force escalation (no early exits).\n   - Search a small grid of candidate (τ1, τ2) (e.g., 19×19 thresholds from score quantiles).\n   - For each (τ1, τ2), form acceptance sets:\n     A1 = {not forced} ∩ {s1 ≤ τ1}  (Direct exits)\n     A2 = {not in A1} ∩ {not forced} ∩ {s2 ≤ τ2} (Brief exits)\n   - Compute calibration errors (k1,n1) on A1 and (k2,n2) on A2, then compute Clopper–Pearson upper bounds U1, U2 with confidence 1−δ.\n   - Choose (τ1*, τ2*) that minimizes expected generated tokens on calibration subject to U1 ≤ α1 and U2 ≤ α2.\n5) Calibrate CRACoT baseline:\n   - Single threshold τ on s1 (Direct) with one conformal risk constraint U ≤ α1 (Direct exits); else escalate directly to Full-CoT.\n   - (Optional but recommended for fairness) Apply the same OOD guard to CRACoT; report results with/without guard as an ablation in the paper text, but keep the core comparison “CAM-CoT vs CRACoT” fixed.\n6) Evaluate on the 240 evaluation examples:\n   - Run CAM-CoT and CRACoT using the calibrated thresholds (no retraining).\n   - Report overall accuracy, average generated tokens, exit fractions, and observed stagewise error rates.\n\nScale adjustment to fit the provided Runner (H200 140GB VRAM, 240GB RAM):\n- Use exactly 300 GSM8K test problems total (60 calibration + 240 evaluation).\n- Use greedy decoding (do_sample=False) and moderate max_new_tokens (16/64/128) to keep runtime predictable.\n- Use a single 8B-parameter model with bf16 and `device_map=\"auto\"` (fits comfortably on a single H200).\n- No fine-tuning; all computation is inference-only. Total generations:\n  - Calibration: 60×3 = 180 generations.\n  - Evaluation: up to 240×(1 to 3) generations depending on early exits.\nThis is small enough to run in a few hours on one H200 even with token-level score extraction.",
     "runner_config": {
       "runner_label": [
         "self-hosted",
@@ -816,110 +816,120 @@
     "evaluation_metrics": [
       {
         "name": "accuracy",
-        "description": "**What it measures:** End-task correctness: proportion of SVAMP test questions for which the model outputs the correct final numeric answer.\n\n**Correctness criteria:**\n1) Extract the model’s *predicted final answer* as a number using a robust rule:\n   - Prefer the last number token in the generated text after stripping commas and whitespace; if the output contains an explicit final-answer marker (e.g., 'Answer:'), prefer the last number after that marker.\n2) Extract the gold answer as a number from the dataset field (`answer`/`result`).\n3) Compare:\n   - If both parse as integers (or integer-valued floats), require exact equality.\n   - Otherwise require absolute tolerance ≤ 1e-3 (handles benign formatting like 0.5 vs 0.500).\n   - If the prediction is missing/unparseable, count as incorrect.\n\n**Calculation method:**\nFor n evaluated examples,\n- accuracy = (1/n) * Σ_i 𝟙[pred_i == gold_i under the numeric comparison above].\n\n**Task appropriateness:** SVAMP is a numeric-answer word-problem benchmark; correctness is primarily about the final number rather than rationale style.\n\n**Relevant visualizations:**\n- Bar chart of accuracy with 95% bootstrap CIs per method.\n- Error histogram of (pred − gold) for numeric non-integer outputs (if any)."
+        "description": "Correctness criteria: A prediction is correct if the extracted final numeric answer equals the gold GSM8K answer after normalization. Normalization: (i) extract the last occurring number token in the model output (regex over optional sign, digits, optional decimal), (ii) remove commas, (iii) compare as exact integer if both are integers; otherwise compare as float with tolerance 1e-6.\n\nCalculation method: accuracy = (1/N) * Σ_i 1[ŷ_i = y_i], where N is the number of evaluation examples.\n\nTask appropriateness: GSM8K is a single-answer arithmetic task; the primary objective is correctness of the final number.\n\nRelevant visualizations: (a) Bar chart of accuracy by method (CAM-CoT vs CRACoT), (b) scatter plot of per-example correctness vs uncertainty score (to illustrate separability)."
       },
       {
-        "name": "demo_acceptance_rate",
-        "description": "**What it measures:** How often a candidate question is accepted as a demonstration under the method’s reliability filter (proxy for strictness and practicality).\n\n**Correctness criteria:** A demo is “accepted” if it passes the method’s acceptance rule for a cluster within the top-T candidates.\n\n**Calculation method:**\nFor k clusters, let c_j be the number of candidates tried until acceptance (capped at T). Define:\n- acceptance_rate = (1/k) * Σ_j 𝟙[accepted within T].\nAlso report mean candidates tried: (1/k) * Σ_j c_j.\n\n**Task appropriateness:** A method that improves accuracy but rarely accepts demos may be impractical; this metric captures that trade-off.\n\n**Relevant visualizations:**\n- Per-cluster acceptance/attempts bar plot.\n- Histogram of candidates tried until acceptance."
+        "name": "avg_gen_tokens",
+        "description": "Correctness criteria: Not applicable (efficiency metric).\n\nCalculation method: avg_gen_tokens = (1/N) * Σ_i T_i where T_i is the total number of newly generated tokens across all stages actually executed for example i (e.g., Direct-only: T_i=T1; Brief: T_i=T1+T2; Full: T_i=T1+T2+T3).\n\nTask appropriateness: The hypothesis is explicitly about an anytime controller that saves compute by stopping earlier; generated tokens are a hardware- and model-agnostic proxy for inference cost.\n\nRelevant visualizations: (a) Accuracy vs avg_gen_tokens Pareto plot, (b) histogram of tokens per example for each method."
       },
       {
-        "name": "mean_reliability_components",
-        "description": "**What it measures:** Average values of the reliability sub-scores used in selection: r_sc (self-consistency), r_pi (paraphrase invariance), and (for C3) r_cc (cycle-consistency grounding).\n\n**Correctness criteria:**\n- r_sc: computed from m sampled CoTs on the original question as the majority-answer frequency.\n- r_pi: computed as the mean probability of producing the global majority answer across paraphrases (estimated by sample frequencies).\n- r_cc: computed as 0.5·cos_sim(emb(q̂), emb(q)) + 0.5·𝟙[numbers(q̂)=numbers(q)].\n\n**Calculation method:**\nFor accepted demos D (|D|=k typically), report:\n- mean_r_sc = (1/|D|) Σ_d r_sc(d)\n- mean_r_pi = (1/|D|) Σ_d r_pi(d)\n- mean_r_cc = (1/|D|) Σ_d r_cc(d) (C3 only)\n- mean_r = (1/|D|) Σ_d (r_sc·r_pi·r_cc) (C3) or (r_sc·r_pi) (PIR).\n\n**Task appropriateness:** Validates the hypothesized mechanism (C3 rejects mis-anchored demos via r_cc).\n\n**Relevant visualizations:**\n- Box/violin plots of r_sc/r_pi/r_cc by method.\n- Scatter plot of r_cc vs per-demo downstream utility (see next metric)."
+        "name": "early_exit_coverage",
+        "description": "Correctness criteria: Not applicable (routing/coverage metric).\n\nCalculation method: For each stage j∈{direct, brief, full}, coverage_j = (#examples that exit at stage j)/N.\nReport: coverage_direct, coverage_brief, coverage_full (they sum to 1).\n\nTask appropriateness: CAM-CoT’s claimed novelty is *multi-stage* stopping; coverage shows whether the controller meaningfully uses intermediate computation rather than degenerating to “always full” or “always direct”.\n\nRelevant visualizations: Stacked bar chart of route fractions per method (CAM-CoT vs CRACoT, where CRACoT has only direct/full)."
       },
       {
-        "name": "grounding_utility_correlation",
-        "description": "**What it measures:** Whether the grounding proxy r_cc predicts downstream usefulness of a selected demonstration (mechanistic validation).\n\n**Correctness criteria:**\n- For each cluster demo d, compute its downstream utility u(d) as the accuracy on the subset of test questions whose embedding is closest to that cluster centroid (or alternatively the subset assigned to that cluster by k-means trained on the demo pool embeddings).\n- Correlate u(d) with r_cc(d) across clusters.\n\n**Calculation method:**\n- Assign each of the N test questions to the nearest of the k cluster centroids (computed from the demo-pool k-means model).\n- For cluster j with demo d_j, compute u_j = (# correct predictions among assigned test questions)/(# assigned test questions).\n- Compute Pearson r (and optionally Spearman ρ) between {r_cc(d_j)} and {u_j}.\n\n**Task appropriateness:** The hypothesis claims r_cc detects mis-anchored reasoning; if true, higher r_cc should align with higher real utility.\n\n**Relevant visualizations:**\n- Scatter plot with regression line: r_cc vs u_j (one point per cluster), with correlation coefficient annotated."
+        "name": "stagewise_error_rate",
+        "description": "Correctness criteria: Same numeric normalization as in accuracy.\n\nCalculation method: For each early-exit stage j∈{direct, brief}, compute conditional error among examples that exited at that stage:\nerr_direct = (#wrong among Direct exits)/(#Direct exits)\nerr_brief  = (#wrong among Brief exits)/(#Brief exits)\nAlso report Wilson or Clopper–Pearson 95% confidence intervals for these conditional proportions on the evaluation set (for descriptive uncertainty; not the conformal guarantee).\n\nTask appropriateness: The core claim is *stagewise reliability control*. Overall accuracy can hide unsafe early exits if most examples escalate; conditional error directly tests whether each cheap stage is safe.\n\nRelevant visualizations: (a) Error bars plot of stagewise error with 95% CI vs target α1, α2 lines, (b) reliability-style plot: error rate as a function of score threshold (monotone trend check)."
+      },
+      {
+        "name": "risk_bound_satisfaction_rate",
+        "description": "Correctness criteria: A method “satisfies bounds” on a run if the *calibration-derived* one-sided Clopper–Pearson upper bounds for each constrained stage are ≤ the target risks.\n\nCalculation method:\n- On calibration set, compute U1 = CP_upper(k1,n1,δ) for Direct exits; for CAM-CoT also compute U2 for Brief exits.\n- Define indicator I = 1[U1 ≤ α1] for CRACoT; for CAM-CoT, I = 1[(U1 ≤ α1) ∧ (U2 ≤ α2)].\nReport this along with (U1,U2,n1,n2) values.\n\nTask appropriateness: The method’s novelty is *finite-sample statistical guarantees*. This metric ensures the implementation actually enforces the constraints during threshold selection.\n\nRelevant visualizations: Table of (n1,k1,U1) and (n2,k2,U2) for CAM-CoT; highlight constraint satisfaction."
+      },
+      {
+        "name": "selective_efficiency",
+        "description": "Correctness criteria: Not applicable (combined metric).\n\nCalculation method: selective_efficiency = accuracy / avg_gen_tokens (tokens in denominator). Also report its reciprocal avg_gen_tokens_per_correct = avg_gen_tokens / accuracy to interpret “tokens spent per correct answer”.\n\nTask appropriateness: Anytime methods aim to improve the accuracy–compute frontier; this scalar summary is useful when only two methods are compared.\n\nRelevant visualizations: (a) Bar chart of tokens_per_correct, (b) Pareto point labels on accuracy–tokens plot."
+      },
+      {
+        "name": "ood_guard_escalation_rate",
+        "description": "Correctness criteria: Not applicable (safety/routing metric).\n\nCalculation method: Using calibration Direct scores {s1_i}, compute conformal p-value for each evaluation example i:\n p_i = (1 + #{k: s1_k ≥ s1_i})/(n_cal+1).\nIf p_i < p_min, the OOD guard forces escalation (disables early exit). Report:\n- escalation_rate = (#forced escalations)/N,\n- forced_direct_exit_rate = 0 by design (sanity check),\n- forced_full_rate among those forced (fraction that go to full after brief stage if brief also rejected).\n\nTask appropriateness: The hypothesis requires a *fail-safe* behavior under atypical uncertainty scores. Even without an external shift dataset (due to the “exactly 1 dataset” constraint), this metric checks that the guard is active and quantifies conservativeness.\n\nRelevant visualizations: (a) Histogram of evaluation s1 overlaid with calibration s1 and guard cutoff implied by p_min, (b) route fraction comparison with/without guard (ablation plot)."
       }
     ],
     "models_to_use": [
       "Qwen3-8B (8B parameters)"
     ],
     "datasets_to_use": [
-      "SVAMP (MU-NLPC/Calc-svamp)"
+      "gsm8k"
     ],
     "proposed_method": {
-      "method_name": "C3-AutoCoT (Cycle-Consistent & Paraphrase-Invariant Reliability Auto-CoT)",
-      "description": "Inference-only enhancement to Auto-CoT demonstration construction. For each candidate demo question, estimate reliability along three label-free axes using only the same base LLM plus cheap post-processing: (1) within-question self-consistency (r_sc), (2) paraphrase invariance with a number-preservation metamorphic filter (r_pi), and (3) cycle-consistency grounding (r_cc) by reconstructing the original question from a representative rationale and scoring semantic+numeric match. Accept a demo if r=r_sc·r_pi·r_cc≥τ, then use standard Auto-CoT downstream prompting with k cluster demos.",
+      "method_name": "CAM-CoT (Conformal Anytime Metacognitive CoT)",
+      "description": "Training-free, inference-time anytime controller for chain-of-thought depth selection with (i) three-stage escalation (Direct → Brief-CoT → Full-CoT), (ii) *stagewise* conformal risk control using Clopper–Pearson bounds to guarantee per-stage early-exit error rates at user-chosen levels (α1 for Direct, α2 for Brief) with confidence 1−δ, and (iii) a conformal typicality (OOD) guard that disables early exits when the Direct-stage uncertainty score is atypical relative to calibration.",
       "optuna_config": {
-        "enabled": true,
-        "n_trials": 20,
+        "enabled": false,
+        "n_trials": 0,
         "search_spaces": [
           {
-            "param_name": "tau",
-            "distribution_type": "uniform",
-            "low": 0.2,
-            "high": 0.6
-          },
-          {
-            "param_name": "m",
+            "param_name": "tau1",
             "distribution_type": "categorical",
             "choices": [
-              3,
-              4,
-              6
+              19
             ]
           },
           {
-            "param_name": "p",
+            "param_name": "tau2",
             "distribution_type": "categorical",
             "choices": [
-              1,
-              2,
-              3
+              19
             ]
           },
           {
-            "param_name": "temperature_sc",
-            "distribution_type": "uniform",
-            "low": 0.4,
-            "high": 0.9
+            "param_name": "p_min_ood",
+            "distribution_type": "categorical",
+            "choices": [
+              0.01,
+              0.03,
+              0.05
+            ]
           },
           {
-            "param_name": "rcc_weight_sim",
-            "distribution_type": "uniform",
-            "low": 0.3,
-            "high": 0.7
+            "param_name": "alpha1",
+            "distribution_type": "categorical",
+            "choices": [
+              0.05,
+              0.1
+            ]
+          },
+          {
+            "param_name": "alpha2",
+            "distribution_type": "categorical",
+            "choices": [
+              0.1,
+              0.15,
+              0.2
+            ]
           }
         ]
       }
     },
     "comparative_methods": [
       {
-        "method_name": "PIR-AutoCoT (Paraphrase-Invariant Reliability Auto-CoT)",
-        "description": "Inference-only demo filtering baseline that extends RW-AutoCoT: accept candidate demos based on (1) within-question self-consistency under multiple sampled CoTs and (2) paraphrase invariance of the answer across LLM-generated paraphrases. Does not include cycle-consistency reconstruction/grounding; reliability combines only r_sc and r_pi (e.g., r=r_sc·r_pi). Uses the same clustering and the same downstream evaluation prompting as C3-AutoCoT.",
+        "method_name": "CRACoT (Single-stage Conformal Risk-Controlled CoT gating)",
+        "description": "Training-free baseline with a single conformal risk-controlled gate: generate Direct answer and compute uncertainty score s1; if s1 ≤ τ (calibrated to satisfy a single risk constraint α1 on accepted Direct exits) then stop; otherwise escalate directly to Full-CoT. This method lacks an intermediate Brief-CoT stage and thus cannot provide separate risk control for mid-cost reasoning.",
         "optuna_config": {
-          "enabled": true,
-          "n_trials": 20,
+          "enabled": false,
+          "n_trials": 0,
           "search_spaces": [
             {
               "param_name": "tau",
-              "distribution_type": "uniform",
-              "low": 0.2,
-              "high": 0.8
-            },
-            {
-              "param_name": "m",
               "distribution_type": "categorical",
               "choices": [
-                3,
-                4,
-                6
+                19
               ]
             },
             {
-              "param_name": "p",
+              "param_name": "alpha1",
               "distribution_type": "categorical",
               "choices": [
-                1,
-                2,
-                3
+                0.05,
+                0.1
               ]
             },
             {
-              "param_name": "temperature_sc",
-              "distribution_type": "uniform",
-              "low": 0.4,
-              "high": 0.9
+              "param_name": "p_min_ood",
+              "distribution_type": "categorical",
+              "choices": [
+                0.01,
+                0.03,
+                0.05
+              ]
             }
           ]
         }
