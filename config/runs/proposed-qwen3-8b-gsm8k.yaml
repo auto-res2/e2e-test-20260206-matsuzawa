@@ -1,0 +1,58 @@
+run_id: proposed-qwen3-8b-gsm8k
+method: CAM-CoT (Conformal Anytime Metacognitive CoT)
+model:
+  name: Qwen3-8B
+  dtype: bfloat16
+  device_map: auto
+  generation:
+    do_sample: false
+    max_new_tokens:
+      direct: 16
+      brief: 64
+      full: 128
+dataset:
+  name: gsm8k
+  split: test
+  subset: main
+  max_examples: 300
+  calibration_size: 60
+  evaluation_size: 240
+  preprocessing:
+    extract_answer_regex: "-?\\d+\\.?\\d*"
+    normalize_commas: true
+training:
+  learning_rate: 0.0
+  batch_size: 1
+  epochs: 0
+  optimizer: none
+  warmup_steps: 0
+  gradient_accumulation_steps: 1
+controller:
+  alpha1: 0.10
+  alpha2: 0.15
+  delta: 0.05
+  p_min_ood: 0.03
+  uncertainty_score: mean_nll_plus_entropy
+  entropy_weight: 0.2
+  threshold_grid:
+    quantiles: 19
+  calibration_objective: minimize_expected_tokens
+  ood_guard: true
+optuna:
+  n_trials: 0
+  search_spaces:
+    - param_name: tau1
+      distribution_type: categorical
+      choices: [19]
+    - param_name: tau2
+      distribution_type: categorical
+      choices: [19]
+    - param_name: p_min_ood
+      distribution_type: categorical
+      choices: [0.01, 0.03, 0.05]
+    - param_name: alpha1
+      distribution_type: categorical
+      choices: [0.05, 0.1]
+    - param_name: alpha2
+      distribution_type: categorical
+      choices: [0.1, 0.15, 0.2]

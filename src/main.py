@@ -1,60 +1,36 @@
+import os
 import subprocess
 import sys
-from pathlib import Path
-from typing import Any, List
 
 import hydra
 from omegaconf import OmegaConf
 
 
-def _apply_mode_overrides(cfg: Any) -> Any:
-    OmegaConf.set_struct(cfg, False)
+@hydra.main(config_path="../config", config_name="config", version_base=None)
+def main(cfg):
     if cfg.mode == "trial":
         cfg.wandb.mode = "disabled"
-        if "optuna" in cfg:
-            cfg.optuna.n_trials = 0
-        if "run" in cfg:
-            cfg.run.optuna.n_trials = 0
-            cfg.run.dataset.splits.train = "train[:50]"
-            cfg.run.dataset.splits.test = "test[:20]"
-            cfg.run.method_config.k_clusters = int(min(2, cfg.run.method_config.k_clusters))
-            cfg.run.method_config.max_candidates_per_cluster = int(
-                min(2, cfg.run.method_config.max_candidates_per_cluster)
-            )
-            cfg.run.method_config.m_self_consistency = int(
-                min(2, cfg.run.method_config.m_self_consistency)
-            )
-            cfg.run.method_config.p_paraphrases = int(min(1, cfg.run.method_config.p_paraphrases))
-            cfg.run.training.epochs = 1
-            cfg.run.training.batch_size = 1
-            cfg.run.training.eval_batch_size = 1
-            cfg.run.training.gradient_accumulation_steps = 1
-            cfg.run.training.max_train_batches = 2
-            cfg.run.training.max_eval_batches = 2
+        cfg.optuna.n_trials = 0
     elif cfg.mode == "full":
         cfg.wandb.mode = "online"
-    return cfg
 
+    run_id = cfg.run
+    run_cfg_path = os.path.join("config", "runs", f"{run_id}.yaml")
+    assert os.path.exists(run_cfg_path), f"Run config not found: {run_cfg_path}"
 
-def _build_overrides(cfg: Any) -> List[str]:
-    overrides = [
-        f"run={cfg.run.run_id}",
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.train",
+        f"run={run_id}",
         f"results_dir={cfg.results_dir}",
         f"mode={cfg.mode}",
         f"wandb.mode={cfg.wandb.mode}",
+        f"optuna.n_trials={cfg.optuna.n_trials}",
     ]
-    return overrides
-
-
-@hydra.main(config_path="../config", config_name="config", version_base="1.3")
-def main(cfg: Any) -> None:
-    cfg = _apply_mode_overrides(cfg)
-    results_dir = Path(cfg.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    overrides = _build_overrides(cfg)
-    cmd = [sys.executable, "-u", "-m", "src.train"] + overrides
-    subprocess.run(cmd, check=True)
+    env = os.environ.copy()
+    env["HYDRA_FULL_ERROR"] = "1"
+    subprocess.run(cmd, check=True, env=env)
 
 
 if __name__ == "__main__":
